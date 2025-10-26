@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  reminder-main:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    image: reminder-app:latest
+    container_name: reminder-main
+    environment:
+      # DB im gemeinsamen Volume:
+      - REMINDER_DB=/data/reminder.sqlite3
+      # Session Secret (bitte anpassen!)
+      - REMINDER_SECRET=${REMINDER_SECRET:-change-me-main}
+      # Healthcheck Pfad der Main-App
+      - HEALTHCHECK_URL=http://127.0.0.1:5000/
+    ports:
+      - "5000:5000"
+    volumes:
+      - reminder_data:/data
+    command: >
+      gunicorn -b 0.0.0.0:5000
+      --workers=2 --threads=4 --timeout=60 app:app
+    restart: unless-stopped
+
+  reminder-kiosk:
+    image: reminder-app:latest
+    container_name: reminder-kiosk
+    depends_on:
+      - reminder-main
+    environment:
+      - REMINDER_DB=/data/reminder.sqlite3
+      - REMINDER_SECRET=${REMINDER_SECRET:-change-me-kiosk}
+      # Optional: Standard-User für Root-Redirect / -> /kiosk/<NAME>
+      - KIOSK_DEFAULT_USER=${KIOSK_DEFAULT_USER:-Alice}
+      # Healthcheck für Kiosk
+      - HEALTHCHECK_URL=http://127.0.0.1:5001/kiosk/${KIOSK_DEFAULT_USER:-Alice}
+    ports:
+      - "5001:5001"
+    volumes:
+      - reminder_data:/data
+    command: >
+      gunicorn -b 0.0.0.0:5001
+      --workers=2 --threads=4 --timeout=60 kiosk:app
+    restart: unless-stopped
+
+volumes:
+  reminder_data:
+    # optionaler Host-Pfad statt Named Volume:
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /opt/reminder/data
