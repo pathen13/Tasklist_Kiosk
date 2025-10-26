@@ -1,10 +1,10 @@
 In Portainer → Stacks → Add stack → Repository
 
-Repository URL: dein Git-Repo
+<strong>Repository URL:</strong> dein Git-Repo
 
-Repository reference: z. B. main
+<strong>Repository reference:</strong> z. B. main
 
-Compose path: docker-compose.yml
+<strong>Compose path:</strong> docker-compose.yml
 
 Deploy.
 
@@ -20,4 +20,4 @@ und reminder-kiosk (http://<IP>:5001)
 
 ACHTUNG:
 
-Diese software hat KEINERLEI sicherheits features. Man kann sich in die App Einloggen, allein mit dem Benuternamen. Auch ist weder der Server noch die Application gehärtet. Diese software sollte NUR local betrieben werden und darf nicht exponiert werden!
+Diese software hat <strong>KEINERLEI</strong> sicherheits features. Man kann sich in die App Einloggen, allein mit dem Benuternamen. Auch ist weder der Server noch die Application gehärtet. Diese software sollte NUR local betrieben werden und darf nicht exponiert werden!
