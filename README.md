@@ -13,9 +13,9 @@ Portainer zieht den Code und baut das Image anhand des Dockerfile (sofern der Po
 
 2 Services werden gestartet:
 
-reminder-main (http://<IP>:5000)
+reminder-main (http://$IP_ADRESS:5000)
 
-und reminder-kiosk (http://<IP>:5001)
+und reminder-kiosk (http://$IP_ADRESS:5001)
 
 
 ACHTUNG:
