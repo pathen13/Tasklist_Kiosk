@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Reminder – Kiosk UI (480x320) mit:
-• Farbigen Karten (hoch=rot getönt, normal=blau, niedrig=teal) + farbigen Tags
-• „hoch“-Tag amber (schwarzer Text), damit „Überfällig“ (rot) klar hervorsticht
-• „Überfällig“-Tag (due_date < heute)
-• Zustands-Zyklus per Button:
-   1) 1× hoch + 2× normal + 1× niedrig  (nur due_date ≥ heute; keine undatierten)
-   2) 4× hoch     (inkl. Vergangenheit & undatiert)
-   3) 4× normal   (inkl. Vergangenheit & undatiert)
-   4) 4× niedrig  (inkl. Vergangenheit & undatiert)
-• Bestätigungsdialog für „Erledigt“ / „Verwerfen“
+Reminder – Kiosk UI (480x320)
+• Auto-Refresh (KIOSK_REFRESH_SECONDS, default 30s)
+• Zustands-Zyklus (1..4) bleibt per Session erhalten
+• Farbige Karten/Tags, amber 'hoch'-Tag, rotes 'Überfällig'
+• Bestätigungsdialog für Erledigt/Verwerfen
+• 'Fällig': Datum + (Tage/Stunden), rot bei < 24h (inkl. überfällig)
+• NEU: Ansichts-Indikator (zeigt Modus + Stückzahl pro Priorität)
 """
 
 from __future__ import annotations
-from datetime import date, datetime
+from datetime import date, datetime, time
 from enum import Enum
 from typing import Optional
-import os
+import os, math
+from collections import Counter
 
 from flask import Flask, render_template, request, redirect, url_for, session, Response
 from jinja2 import DictLoader
@@ -30,16 +28,17 @@ from sqlalchemy.types import String, Text, Date
 # ----------------------------------------------------------------------------
 DB_PATH = os.environ.get("REMINDER_DB", "reminder.sqlite3")
 SECRET_KEY = os.environ.get("REMINDER_SECRET", "dev-secret-change-me")
-DEFAULT_KIOSK_USER = os.environ.get("KIOSK_DEFAULT_USER")  # optional für Root-Redirect
+DEFAULT_KIOSK_USER = os.environ.get("KIOSK_DEFAULT_USER")  # optional Redirect von /
+REFRESH_SECONDS = int(os.environ.get("KIOSK_REFRESH_SECONDS", "30"))  # Auto-Refresh
 
 app = Flask(__name__)
-app.config.update(SECRET_KEY=SECRET_KEY)
+app.config.update(SECRET_KEY=SECRET_KEY, SEND_FILE_MAX_AGE_DEFAULT=0)
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
 
 class Base(DeclarativeBase): pass
 
 # ----------------------------------------------------------------------------
-# Modelle (müssen String-gleich zur Main-App sein)
+# Modelle (Strings müssen zur Main-App passen)
 # ----------------------------------------------------------------------------
 class Priority(str, Enum):
     low = "niedrig"
@@ -71,9 +70,6 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
 
-# Keine Schemainit hier:
-# Base.metadata.create_all(engine)
-
 def get_db() -> Session: return Session(engine)
 def _ci_name(db: Session, name: str) -> Optional[User]:
     return db.scalar(select(User).where(func.lower(User.name) == (name or "").strip().lower()))
@@ -86,7 +82,7 @@ def root():
     if DEFAULT_KIOSK_USER:
         return redirect(url_for("kiosk_view", name=DEFAULT_KIOSK_USER))
     return ("Kiosk läuft. Aufruf: /kiosk/<NAME> (z. B. /kiosk/Alice) "
-            "– oder KIOSK_DEFAULT_USER in der Umgebung setzen.", 200,
+            "– oder KIOSK_DEFAULT_USER setzen.", 200,
             {"Content-Type": "text/plain; charset=utf-8"})
 
 @app.route("/favicon.ico")
@@ -94,7 +90,7 @@ def favicon():
     return Response(status=204)
 
 # ----------------------------------------------------------------------------
-# Templates (farbige Karten/Tags, amber hoch, Überfällig + Confirm-Modal)
+# Templates (mit Ansichts-Indikator)
 # ----------------------------------------------------------------------------
 TEMPLATES = {
 "base.html": r"""
@@ -121,6 +117,9 @@ TEMPLATES = {
 
     /* Überfällig (Rot) */
     --ov-tag:#b91c1c;   --ov-border:#8a1313;
+
+    /* Zeitwarnung */
+    --hrs-warn:#ff6b6b;
   }
 
   *{box-sizing:border-box}
@@ -136,6 +135,7 @@ TEMPLATES = {
   .desc{font-size:var(--fs-m);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
   .tags{display:flex;gap:4px}
   .due{font-size:var(--fs-xs); color:var(--muted)}
+  .due .timebreak.soon{ color:var(--hrs-warn); font-weight:800; }
   .tag{font-size:var(--fs-xs);padding:2px 6px;border-radius:999px;color:#fff;border:1px solid transparent}
 
   .task.high   { background:var(--hi-bg); border:1px solid var(--hi-border); }
@@ -171,6 +171,14 @@ TEMPLATES = {
   .confirm_text{ font-size:var(--fs-xs); color:var(--muted) }
   .confirm_actions{ display:flex; gap:8px }
   .btn.sm{ height:34px; font-size:12px; font-weight:800; }
+
+  /* Mode indicator */
+  .modebox{
+    background:#0f1422; border:1px solid #2a344e; border-radius:10px;
+    padding:8px; display:flex; flex-direction:column; gap:4px;
+  }
+  .mode-title{ font-weight:800; font-size:var(--fs-m) }
+  .mode-desc{ font-size:var(--fs-xs); color:var(--muted) }
 </style>
 </head>
 <body>
@@ -251,6 +259,20 @@ TEMPLATES = {
     const first=document.querySelector('.task');
     if(first) selectTask(first.dataset.id);
   });
+
+  // ---- Auto-Refresh (pausiert, wenn Confirm-Dialog offen ist) ----
+  const REFRESH_MS = {{ refresh_ms }};
+  if (REFRESH_MS > 0) {
+    setInterval(() => {
+      const ov = document.getElementById('confirm_overlay');
+      const isOpen = ov && getComputedStyle(ov).display !== 'none';
+      if (!isOpen) {
+        const url = new URL(window.location.href);
+        url.searchParams.set('_ts', Date.now().toString());
+        window.location.replace(url.toString());
+      }
+    }, REFRESH_MS);
+  }
 </script>
 </body>
 </html>
@@ -262,6 +284,8 @@ TEMPLATES = {
   {% for t in tasks_to_show %}
     {% set cls = 'high' if t.priority == 'hoch' else ('normal' if t.priority == 'normal' else 'low') %}
     {% set overdue = (t.due_date is not none) and (t.due_date < today) %}
+    {% set hrs_total = hours_left_map.get(t.id) %}
+    {% set dh_text = dh_text_map.get(t.id) %}
     <div class="task {{ cls }}" data-id="{{ t.id }}" onclick="selectTask('{{ t.id }}')">
       <div class="hdr">
         <div class="desc">{{ t.description }}</div>
@@ -270,14 +294,26 @@ TEMPLATES = {
           {% if overdue %}<div class="tag overdue">Überfällig</div>{% endif %}
         </div>
       </div>
-      <div class="due">Fällig: {{ t.due_date.isoformat() if t.due_date else '–' }}</div>
+      <div class="due">
+        Fällig: {{ t.due_date.isoformat() if t.due_date else '–' }}
+        {% if hrs_total is not none %}
+          (<span class="timebreak {% if hrs_total < 24 %}soon{% endif %}">{{ dh_text }}</span>)
+        {% endif %}
+      </div>
     </div>
   {% endfor %}
   {% if not tasks_to_show %}<div class="empty">Keine offenen Aufgaben</div>{% endif %}
 {% endblock %}
 
 {% block right %}
-  <form id="action_form" method="post" action="{{ url_for('kiosk_action', name=user.name) }}" style="display:flex;flex-direction:column;gap:6px">
+  <!-- Ansicht-Indicator -->
+  <div class="modebox">
+    <div class="mode-title">Ansicht {{ mode }}</div>
+    <div class="mode-desc">{{ mode_summary }}</div>
+    <div class="mode-desc">Aktualisierung: alle {{ refresh_sec }}s</div>
+  </div>
+
+  <form id="action_form" method="post" action="{{ url_for('kiosk_action', name=user.name) }}" style="display:flex;flex-direction:column;gap:6px;margin-top:6px">
     <input type="hidden" id="selected_task_id" name="task_id" value="">
     <input type="hidden" id="action_input"   name="action"  value="">
     <button class="btn ok"  id="btn_done"    type="button">✔ Erledigt</button>
@@ -290,7 +326,7 @@ TEMPLATES = {
 app.jinja_loader = DictLoader(TEMPLATES)
 
 # ----------------------------------------------------------------------------
-# Routen
+# Routen & Logik
 # ----------------------------------------------------------------------------
 @app.route("/kiosk/<name>")
 def kiosk_view(name: str):
@@ -315,9 +351,9 @@ def kiosk_view(name: str):
 
         def base_for_mode():
             if mode == 1:
-                # Nur Aufgaben mit Datum heute oder später (keine Vergangenheit, keine undatierten)
+                # Nur due_date >= heute (keine Vergangenheit, keine undatierten)
                 return [t for t in all_open_sorted if t.due_date is not None and t.due_date >= today]
-            # Modi 2–4: auch Vergangenheit & undatiert
+            # Modi 2–4: inkl. Vergangenheit & undatiert
             return list(all_open_sorted)
 
         base = base_for_mode()
@@ -336,7 +372,50 @@ def kiosk_view(name: str):
         else:
             tasks_to_show = take(Priority.low.value, 4)
 
-        return render_template("view.html", user=user, tasks_to_show=tasks_to_show, today=today)
+        # ---- Zeit bis Ende des Fälligkeitstags (in Stunden) + Darstellung "x Tag(e), y Stunde(n)"
+        def hours_left_until_day_end(d: Optional[date]) -> Optional[int]:
+            if d is None:
+                return None
+            now = datetime.now()
+            due_end = datetime.combine(d, time(23, 59, 59))
+            delta = due_end - now
+            return math.floor(delta.total_seconds() / 3600)
+
+        def de_plural(n: int, singular: str, plural: str) -> str:
+            return singular if abs(n) == 1 else plural
+
+        def format_days_hours(total_hours: int) -> str:
+            sign = "-" if total_hours < 0 else ""
+            ah = abs(total_hours)
+            days = ah // 24
+            hours = ah % 24
+            if days == 0:
+                return f"{sign}{hours} {de_plural(hours,'Stunde','Stunden')}"
+            else:
+                return f"{sign}{days} {de_plural(days,'Tag','Tage')}, {hours} {de_plural(hours,'Stunde','Stunden')}"
+
+        hours_left_map = {t.id: hours_left_until_day_end(t.due_date) for t in tasks_to_show}
+        dh_text_map = {tid: (format_days_hours(h) if h is not None else None)
+                       for tid, h in hours_left_map.items()}
+
+        # ---- Ansichts-Indikator: echte Stückzahlen pro Prio der aktuell sichtbaren Liste
+        cnt = Counter(t.priority for t in tasks_to_show)
+        mode_summary = f"{cnt.get('hoch',0)}× hoch, {cnt.get('normal',0)}× normal, {cnt.get('niedrig',0)}× niedrig"
+
+        # Refresh-Intervall
+        refresh_sec = max(0, int(REFRESH_SECONDS))
+        refresh_ms = refresh_sec * 1000
+
+        return render_template("view.html",
+                               user=user,
+                               tasks_to_show=tasks_to_show,
+                               today=today,
+                               refresh_ms=refresh_ms,
+                               refresh_sec=refresh_sec,
+                               hours_left_map=hours_left_map,
+                               dh_text_map=dh_text_map,
+                               mode=mode,
+                               mode_summary=mode_summary)
 
 @app.route("/kiosk/<name>/action", methods=["POST"])
 def kiosk_action(name: str):
