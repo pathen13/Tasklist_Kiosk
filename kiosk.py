@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Reminder – Kiosk UI (480x320)
-• Auto-Refresh (KIOSK_REFRESH_SECONDS, default 30s)
-• Zustands-Zyklus (1..4) bleibt per Session erhalten
-• Farbige Karten/Tags, amber 'hoch'-Tag, rotes 'Überfällig'
-• Bestätigungsdialog für Erledigt/Verwerfen
-• 'Fällig': Datum + (Tage/Stunden), rot bei < 24h (inkl. überfällig)
-• NEU: Ansichts-Indikator (zeigt Modus + Stückzahl pro Priorität)
+Reminder – Kiosk UI (480x320), Single-File
+
+Features:
+• Farbige Karten (hoch=rot getönt, normal=blau, niedrig=teal) + farbige Tags
+• 'hoch'-Tag in amber (schwarz), damit 'Überfällig' (rot) klar hervorsticht
+• 'Überfällig'-Tag, wenn due_date < heute
+• Fälligkeitsanzeige: Datum + (X Tage, Y Stunden); rot bei < 24h oder negativ
+• 4 Ansichten (zyklisch per Button):
+   1) 1× hoch + 2× normal + 1× niedrig  (nur due_date ≥ heute; keine undatierten)
+   2) 4× hoch     (inkl. Vergangenheit & undatiert)
+   3) 4× normal   (inkl. Vergangenheit & undatiert)
+   4) 4× niedrig  (inkl. Vergangenheit & undatiert)
+• Auto-Refresh (pausiert bei offenem Bestätigungsdialog)
+• Modebar oben rechts (klickbar: Minimal <-> Mehrzeilig-Detail, Zustand in localStorage)
 """
 
 from __future__ import annotations
 from datetime import date, datetime, time
 from enum import Enum
 from typing import Optional
-import os, math
 from collections import Counter
+import os, math
 
 from flask import Flask, render_template, request, redirect, url_for, session, Response
 from jinja2 import DictLoader
@@ -28,8 +35,8 @@ from sqlalchemy.types import String, Text, Date
 # ----------------------------------------------------------------------------
 DB_PATH = os.environ.get("REMINDER_DB", "reminder.sqlite3")
 SECRET_KEY = os.environ.get("REMINDER_SECRET", "dev-secret-change-me")
-DEFAULT_KIOSK_USER = os.environ.get("KIOSK_DEFAULT_USER")  # optional Redirect von /
-REFRESH_SECONDS = int(os.environ.get("KIOSK_REFRESH_SECONDS", "30"))  # Auto-Refresh
+DEFAULT_KIOSK_USER = os.environ.get("KIOSK_DEFAULT_USER")              # optional Redirect von /
+REFRESH_SECONDS = int(os.environ.get("KIOSK_REFRESH_SECONDS", "30"))    # Auto-Refresh
 
 app = Flask(__name__)
 app.config.update(SECRET_KEY=SECRET_KEY, SEND_FILE_MAX_AGE_DEFAULT=0)
@@ -75,22 +82,7 @@ def _ci_name(db: Session, name: str) -> Optional[User]:
     return db.scalar(select(User).where(func.lower(User.name) == (name or "").strip().lower()))
 
 # ----------------------------------------------------------------------------
-# Komfort: Root & Favicon
-# ----------------------------------------------------------------------------
-@app.route("/")
-def root():
-    if DEFAULT_KIOSK_USER:
-        return redirect(url_for("kiosk_view", name=DEFAULT_KIOSK_USER))
-    return ("Kiosk läuft. Aufruf: /kiosk/<NAME> (z. B. /kiosk/Alice) "
-            "– oder KIOSK_DEFAULT_USER setzen.", 200,
-            {"Content-Type": "text/plain; charset=utf-8"})
-
-@app.route("/favicon.ico")
-def favicon():
-    return Response(status=204)
-
-# ----------------------------------------------------------------------------
-# Templates (mit Ansichts-Indikator)
+# Templates (inline via DictLoader)
 # ----------------------------------------------------------------------------
 TEMPLATES = {
 "base.html": r"""
@@ -158,27 +150,20 @@ TEMPLATES = {
 
   .empty{color:var(--muted);font-size:var(--fs-xs);text-align:center;padding:6px}
 
-  /* Modal */
-  #confirm_overlay{
-    position:fixed; inset:0; background:rgba(0,0,0,.55);
-    display:none; align-items:center; justify-content:center; z-index:9999;
+  /* Modebar (klickbar), erlaubt Zeilenumbrüche in der Detailansicht */
+  .modebar{
+    font-size: var(--fs-xs);
+    color: var(--muted);
+    white-space: pre-line; /* <- wichtig: \n wird als Zeilenumbruch dargestellt */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 4px 6px;
+    border-radius: 6px;
+    border: 1px solid #2a344e;
+    background: #0f1422;
+    cursor: pointer;
+    user-select: none;
   }
-  .confirm_card{
-    width:calc(100% - 40px); max-width:420px; background:#101623;
-    border:1px solid #2a344e; border-radius:12px; padding:10px; display:flex; flex-direction:column; gap:8px;
-  }
-  .confirm_title{ font-weight:800; font-size:var(--fs-m) }
-  .confirm_text{ font-size:var(--fs-xs); color:var(--muted) }
-  .confirm_actions{ display:flex; gap:8px }
-  .btn.sm{ height:34px; font-size:12px; font-weight:800; }
-
-  /* Mode indicator */
-  .modebox{
-    background:#0f1422; border:1px solid #2a344e; border-radius:10px;
-    padding:8px; display:flex; flex-direction:column; gap:4px;
-  }
-  .mode-title{ font-weight:800; font-size:var(--fs-m) }
-  .mode-desc{ font-size:var(--fs-xs); color:var(--muted) }
 </style>
 </head>
 <body>
@@ -188,13 +173,13 @@ TEMPLATES = {
   </div>
 
   <!-- Bestätigungsdialog -->
-  <div id="confirm_overlay" role="dialog" aria-modal="true" aria-labelledby="confirm_title">
-    <div class="confirm_card">
-      <div id="confirm_title" class="confirm_title">Bestätigen</div>
-      <div id="confirm_text" class="confirm_text">Aktion wirklich ausführen?</div>
-      <div class="confirm_actions">
-        <button id="confirm_cancel" class="btn sm">Abbrechen</button>
-        <button id="confirm_ok" class="btn sm">Bestätigen</button>
+  <div id="confirm_overlay" role="dialog" aria-modal="true" aria-labelledby="confirm_title" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.55); align-items:center; justify-content:center; z-index:9999;">
+    <div class="confirm_card" style="width:calc(100% - 40px); max-width:420px; background:#101623; border:1px solid #2a344e; border-radius:12px; padding:10px; display:flex; flex-direction:column; gap:8px;">
+      <div id="confirm_title" class="confirm_title" style="font-weight:800; font-size:var(--fs-m)">Bestätigen</div>
+      <div id="confirm_text" class="confirm_text" style="font-size:var(--fs-xs); color:var(--muted)">Aktion wirklich ausführen?</div>
+      <div class="confirm_actions" style="display:flex; gap:8px">
+        <button id="confirm_cancel" class="btn sm" style="height:34px; font-size:12px; font-weight:800;">Abbrechen</button>
+        <button id="confirm_ok" class="btn sm" style="height:34px; font-size:12px; font-weight:800;">Bestätigen</button>
       </div>
     </div>
   </div>
@@ -260,6 +245,27 @@ TEMPLATES = {
     if(first) selectTask(first.dataset.id);
   });
 
+  // ---- Modebar Toggle (Minimal <-> Mehrzeilig-Detail), Zustand in localStorage ----
+  function renderModebar(){
+    const el = document.getElementById('modebar');
+    if(!el) return;
+    const expanded = localStorage.getItem('modebarExpanded') === '1';
+    const minText = el.dataset.min;    // z. B. "Ansicht 2"
+    const fullText = el.dataset.full;  // z. B. "Ansicht 2\n1x hoch, 2x normal, 0x niedrig\nAktualisierung alle 30 sec"
+    el.textContent = expanded ? fullText : minText; // white-space:pre-line -> \n sichtbar
+  }
+  window.addEventListener('DOMContentLoaded', ()=>{
+    const el = document.getElementById('modebar');
+    if(el){
+      renderModebar();
+      el.addEventListener('click', ()=>{
+        const expanded = localStorage.getItem('modebarExpanded') === '1';
+        localStorage.setItem('modebarExpanded', expanded ? '0' : '1');
+        renderModebar();
+      });
+    }
+  });
+
   // ---- Auto-Refresh (pausiert, wenn Confirm-Dialog offen ist) ----
   const REFRESH_MS = {{ refresh_ms }};
   if (REFRESH_MS > 0) {
@@ -306,11 +312,12 @@ TEMPLATES = {
 {% endblock %}
 
 {% block right %}
-  <!-- Ansicht-Indicator -->
-  <div class="modebox">
-    <div class="mode-title">Ansicht {{ mode }}</div>
-    <div class="mode-desc">{{ mode_summary }}</div>
-    <div class="mode-desc">Aktualisierung: alle {{ refresh_sec }}s</div>
+  <!-- Modebar: minimal vs. mehrzeilig per Klick (Texte als data-Attribute) -->
+  <div id="modebar"
+       class="modebar"
+       data-min="Ansicht {{ mode }}"
+       data-full="Ansicht {{ mode }}&#10;{{ cnt_high }}x hoch, {{ cnt_normal }}x normal, {{ cnt_low }}x niedrig&#10;Aktualisierung alle {{ refresh_sec }} sec">
+    Ansicht {{ mode }}
   </div>
 
   <form id="action_form" method="post" action="{{ url_for('kiosk_action', name=user.name) }}" style="display:flex;flex-direction:column;gap:6px;margin-top:6px">
@@ -324,6 +331,20 @@ TEMPLATES = {
 """
 }
 app.jinja_loader = DictLoader(TEMPLATES)
+
+# ----------------------------------------------------------------------------
+# Komfort: Root & Favicon
+# ----------------------------------------------------------------------------
+@app.route("/")
+def root():
+    if DEFAULT_KIOSK_USER:
+        return redirect(url_for("kiosk_view", name=DEFAULT_KIOSK_USER))
+    return ("Kiosk läuft. Aufruf: /kiosk/<NAME> (z. B. /kiosk/Alice) – oder KIOSK_DEFAULT_USER setzen.",
+            200, {"Content-Type": "text/plain; charset=utf-8"})
+
+@app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
 
 # ----------------------------------------------------------------------------
 # Routen & Logik
@@ -398,11 +419,13 @@ def kiosk_view(name: str):
         dh_text_map = {tid: (format_days_hours(h) if h is not None else None)
                        for tid, h in hours_left_map.items()}
 
-        # ---- Ansichts-Indikator: echte Stückzahlen pro Prio der aktuell sichtbaren Liste
+        # ---- Modebar-Zähler (aktuelle sichtbare Liste)
         cnt = Counter(t.priority for t in tasks_to_show)
-        mode_summary = f"{cnt.get('hoch',0)}× hoch, {cnt.get('normal',0)}× normal, {cnt.get('niedrig',0)}× niedrig"
+        cnt_high   = cnt.get('hoch', 0)
+        cnt_normal = cnt.get('normal', 0)
+        cnt_low    = cnt.get('niedrig', 0)
 
-        # Refresh-Intervall
+        # Refresh
         refresh_sec = max(0, int(REFRESH_SECONDS))
         refresh_ms = refresh_sec * 1000
 
@@ -415,7 +438,7 @@ def kiosk_view(name: str):
                                hours_left_map=hours_left_map,
                                dh_text_map=dh_text_map,
                                mode=mode,
-                               mode_summary=mode_summary)
+                               cnt_high=cnt_high, cnt_normal=cnt_normal, cnt_low=cnt_low)
 
 @app.route("/kiosk/<name>/action", methods=["POST"])
 def kiosk_action(name: str):
