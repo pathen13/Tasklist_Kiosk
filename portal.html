@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>Kiosk Portal</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; }
+    .container {
+      display: flex;
+      flex-direction: column;
+      height: 100vh; /* volle Fensterhöhe */
+    }
+    iframe.frame {
+      flex: 1;       /* je 50% Höhe */
+      width: 100%;
+      border: 0;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <iframe class="frame" src="http://192.168.178.21:5001/kiosk/patrick?refresh=25"></iframe>
+    <iframe class="frame" src="http://192.168.178.21:5001/kiosk/patrickwork?refresh=31"></iframe>
+  </div>
+</body>
+</html>
