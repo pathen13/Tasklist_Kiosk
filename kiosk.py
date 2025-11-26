@@ -334,7 +334,7 @@ TEMPLATES = {
     <input type="hidden" id="selected_task_id" name="task_id" value="">
     <input type="hidden" id="action_input"   name="action"  value="">
     <button class="btn ok"  id="btn_done"    type="button">✔ Erledigt</button>
-    <button class="btn bad" id="btn_discard" type="button">🗑 Verwerfen</button>
+    <button class="btn bad" id="btn_discard" type="button">🗑 Löschen</button>
     <button class="btn alt" id="btn_cycle"   type="button">↻ Ansicht wechseln</button>
   </form>
 {% endblock %}
