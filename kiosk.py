@@ -4,17 +4,19 @@
 Reminder – Kiosk UI (480x320), Single-File
 
 Features:
-• Farbige Karten (hoch=rot getönt, normal=blau, niedrig=teal) + farbige Tags
-• 'hoch'-Tag in amber (schwarz), damit 'Überfällig' (rot) klar hervorsticht
-• 'Überfällig'-Tag, wenn due_date < heute
+• Farbige Karten/Tags (hoch=rot getönt, normal=blau, niedrig=teal), 'hoch'-Tag amber, 'Überfällig'-Tag rot
 • Fälligkeitsanzeige: Datum + (X Tage, Y Stunden); rot bei < 24h oder negativ
 • 4 Ansichten (zyklisch per Button):
    1) 1× hoch + 2× normal + 1× niedrig  (nur due_date ≥ heute; keine undatierten)
    2) 4× hoch     (inkl. Vergangenheit & undatiert)
    3) 4× normal   (inkl. Vergangenheit & undatiert)
    4) 4× niedrig  (inkl. Vergangenheit & undatiert)
-• Auto-Refresh (pausiert bei offenem Bestätigungsdialog)
-• Modebar oben rechts (klickbar: Minimal <-> Mehrzeilig-Detail, Zustand in localStorage)
+• Bestätigungsdialog für Erledigt/Verwerfen
+• Auto-Refresh (pausiert im Dialog); Override per ?refresh=NN; kleiner Jitter
+• Modebar oben rechts (klickbar: Minimal „Ansicht X“ <-> Mehrzeilig-Detail), Zustand in localStorage
+• iFrame-freundlich: SQLite check_same_thread=False, No-Cache-Header, threaded Server
+Env:
+  REMINDER_DB, REMINDER_SECRET, KIOSK_DEFAULT_USER, KIOSK_REFRESH_SECONDS
 """
 
 from __future__ import annotations
@@ -36,11 +38,18 @@ from sqlalchemy.types import String, Text, Date
 DB_PATH = os.environ.get("REMINDER_DB", "reminder.sqlite3")
 SECRET_KEY = os.environ.get("REMINDER_SECRET", "dev-secret-change-me")
 DEFAULT_KIOSK_USER = os.environ.get("KIOSK_DEFAULT_USER")              # optional Redirect von /
-REFRESH_SECONDS = int(os.environ.get("KIOSK_REFRESH_SECONDS", "30"))    # Auto-Refresh
+REFRESH_SECONDS_DEFAULT = int(os.environ.get("KIOSK_REFRESH_SECONDS", "30"))
 
 app = Flask(__name__)
 app.config.update(SECRET_KEY=SECRET_KEY, SEND_FILE_MAX_AGE_DEFAULT=0)
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
+
+# SQLite Engine: iFrame/Parallelzugriffe -> Threading erlauben
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    echo=False,
+    future=True,
+    connect_args={"check_same_thread": False}
+)
 
 class Base(DeclarativeBase): pass
 
@@ -80,6 +89,14 @@ class Task(Base):
 def get_db() -> Session: return Session(engine)
 def _ci_name(db: Session, name: str) -> Optional[User]:
     return db.scalar(select(User).where(func.lower(User.name) == (name or "").strip().lower()))
+
+# No-Cache für iFrames / Reload-Sauberkeit
+@app.after_request
+def add_no_cache_headers(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 # ----------------------------------------------------------------------------
 # Templates (inline via DictLoader)
@@ -154,7 +171,7 @@ TEMPLATES = {
   .modebar{
     font-size: var(--fs-xs);
     color: var(--muted);
-    white-space: pre-line; /* <- wichtig: \n wird als Zeilenumbruch dargestellt */
+    white-space: pre-line; /* \n -> sichtbare Zeilenumbrüche */
     overflow: hidden;
     text-overflow: ellipsis;
     padding: 4px 6px;
@@ -208,28 +225,20 @@ TEMPLATES = {
 
   function openConfirm(action){
     const id = document.getElementById('selected_task_id').value;
-    if(!id){
-      alert("Bitte zuerst eine Aufgabe auswählen.");
-      return;
-    }
+    if(!id){ alert("Bitte zuerst eine Aufgabe auswählen."); return; }
     pendingAction = action;
     const el = document.querySelector(`.task[data-id="${id}"] .desc`);
     const title = (action==='done' ? "Erledigt" : "Verwerfen");
     confirmText.textContent = `${title} – „${el ? el.textContent : 'Ausgewählte Aufgabe'}“?`;
     confirmOk.classList.remove('ok','bad','btn');
-    confirmOk.classList.add(action==='done' ? 'ok' : 'bad', 'btn'); // grün/rot
+    confirmOk.classList.add(action==='done' ? 'ok' : 'bad', 'btn');
     overlay.style.display='flex';
   }
   function closeConfirm(){ overlay.style.display='none'; pendingAction=null; }
 
   if(btnDone){    btnDone.addEventListener('click', ()=>openConfirm('done')); }
   if(btnDiscard){ btnDiscard.addEventListener('click', ()=>openConfirm('discard')); }
-  if(btnCycle){
-    btnCycle.addEventListener('click', ()=>{
-      actionInput.value='cycle';
-      form.submit();
-    });
-  }
+  if(btnCycle){   btnCycle.addEventListener('click', ()=>{ actionInput.value='cycle'; form.submit(); }); }
 
   confirmCancel.addEventListener('click', closeConfirm);
   confirmOk.addEventListener('click', ()=>{
@@ -245,14 +254,14 @@ TEMPLATES = {
     if(first) selectTask(first.dataset.id);
   });
 
-  // ---- Modebar Toggle (Minimal <-> Mehrzeilig-Detail), Zustand in localStorage ----
+  // Modebar Toggle (Minimal <-> Mehrzeilig-Detail), Zustand in localStorage
   function renderModebar(){
     const el = document.getElementById('modebar');
     if(!el) return;
     const expanded = localStorage.getItem('modebarExpanded') === '1';
-    const minText = el.dataset.min;    // z. B. "Ansicht 2"
-    const fullText = el.dataset.full;  // z. B. "Ansicht 2\n1x hoch, 2x normal, 0x niedrig\nAktualisierung alle 30 sec"
-    el.textContent = expanded ? fullText : minText; // white-space:pre-line -> \n sichtbar
+    const minText  = el.dataset.min;   // "Ansicht X"
+    const fullText = el.dataset.full;  // "Ansicht X\n...Zähler...\nAktualisierung alle Ns"
+    el.textContent = expanded ? fullText : minText; // white-space:pre-line aktiv
   }
   window.addEventListener('DOMContentLoaded', ()=>{
     const el = document.getElementById('modebar');
@@ -266,9 +275,10 @@ TEMPLATES = {
     }
   });
 
-  // ---- Auto-Refresh (pausiert, wenn Confirm-Dialog offen ist) ----
+  // Auto-Refresh (pausiert, wenn Confirm-Dialog offen ist) + kleiner Jitter
   const REFRESH_MS = {{ refresh_ms }};
   if (REFRESH_MS > 0) {
+    const jitter = Math.floor(Math.random()*500); // 0..499ms
     setInterval(() => {
       const ov = document.getElementById('confirm_overlay');
       const isOpen = ov && getComputedStyle(ov).display !== 'none';
@@ -277,7 +287,7 @@ TEMPLATES = {
         url.searchParams.set('_ts', Date.now().toString());
         window.location.replace(url.toString());
       }
-    }, REFRESH_MS);
+    }, REFRESH_MS + jitter);
   }
 </script>
 </body>
@@ -393,10 +403,9 @@ def kiosk_view(name: str):
         else:
             tasks_to_show = take(Priority.low.value, 4)
 
-        # ---- Zeit bis Ende des Fälligkeitstags (in Stunden) + Darstellung "x Tag(e), y Stunde(n)"
+        # Zeit bis Ende des Fälligkeitstags (in Stunden) + Darstellung "x Tag(e), y Stunde(n)"
         def hours_left_until_day_end(d: Optional[date]) -> Optional[int]:
-            if d is None:
-                return None
+            if d is None: return None
             now = datetime.now()
             due_end = datetime.combine(d, time(23, 59, 59))
             delta = due_end - now
@@ -408,25 +417,27 @@ def kiosk_view(name: str):
         def format_days_hours(total_hours: int) -> str:
             sign = "-" if total_hours < 0 else ""
             ah = abs(total_hours)
-            days = ah // 24
-            hours = ah % 24
+            days, hours = divmod(ah, 24)
             if days == 0:
                 return f"{sign}{hours} {de_plural(hours,'Stunde','Stunden')}"
-            else:
-                return f"{sign}{days} {de_plural(days,'Tag','Tage')}, {hours} {de_plural(hours,'Stunde','Stunden')}"
+            return f"{sign}{days} {de_plural(days,'Tag','Tage')}, {hours} {de_plural(hours,'Stunde','Stunden')}"
 
         hours_left_map = {t.id: hours_left_until_day_end(t.due_date) for t in tasks_to_show}
         dh_text_map = {tid: (format_days_hours(h) if h is not None else None)
                        for tid, h in hours_left_map.items()}
 
-        # ---- Modebar-Zähler (aktuelle sichtbare Liste)
+        # Modebar-Zähler (aktuelle sichtbare Liste)
         cnt = Counter(t.priority for t in tasks_to_show)
         cnt_high   = cnt.get('hoch', 0)
         cnt_normal = cnt.get('normal', 0)
         cnt_low    = cnt.get('niedrig', 0)
 
-        # Refresh
-        refresh_sec = max(0, int(REFRESH_SECONDS))
+        # Refresh: Default aus Env, Override per ?refresh=NN
+        refresh_sec = max(0, int(REFRESH_SECONDS_DEFAULT))
+        q_refresh = request.args.get("refresh")
+        if q_refresh:
+            try: refresh_sec = max(0, int(q_refresh))
+            except Exception: pass
         refresh_ms = refresh_sec * 1000
 
         return render_template("view.html",
@@ -451,8 +462,7 @@ def kiosk_action(name: str):
         session.modified = True
         return redirect(url_for("kiosk_view", name=name))
 
-    # Statusänderung erfordert gewählte Task-ID
-    task_id = request.form.get("task_id")
+    task_id = request.form.get("task_id")  # Statusänderung erfordert gewählte Task-ID
     if not task_id:
         return redirect(url_for("kiosk_view", name=name))
 
@@ -471,4 +481,5 @@ def kiosk_action(name: str):
 # Main
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    # Devserver threaded & ohne Re-loader (stabiler für iFrames); Prod: gunicorn nutzen (siehe README)
+    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True, use_reloader=False)
